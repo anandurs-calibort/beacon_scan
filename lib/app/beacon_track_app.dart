@@ -24,6 +24,7 @@ class BeaconTrackApp extends StatelessWidget {
 }
 
 enum BeaconScanMode { balanced, lowPower, aggressive }
+
 class BeaconScannerScreen extends StatefulWidget {
   const BeaconScannerScreen({super.key});
 
@@ -40,16 +41,9 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
   final Map<String, Observation> _found = {};
   final List<Observation> _list = [];
 
-  // Power-safe scan modes (Low Power / Balanced / Aggressive)
+  // Default mode and refresh rate
   ScanMode _scanMode = ScanMode.balanced;
-
-  // Refresh rate (1 Hz configurable)
   Duration _uiTick = const Duration(seconds: 1);
-  final Map<String, Duration> _hzPresets = const {
-    "0.5 Hz (every 2s)": Duration(seconds: 2),
-    "1 Hz (every 1s)": Duration(seconds: 1),
-    "2 Hz (every 0.5s)": Duration(milliseconds: 500),
-  };
 
   @override
   void initState() {
@@ -57,9 +51,31 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
     _ensurePermissions();
   }
 
-  // Permissions handling
-
+  // ------------------------------------------------------------
+  // Permissions
+  // ------------------------------------------------------------
   Future<void> _ensurePermissions() async {
+    // 🟢 Step 1: Show user-friendly rationale before system prompt
+    await showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Permission Required'),
+        content: const Text(
+          'This app needs Bluetooth and Location permissions to detect nearby beacons.\n\n'
+              '• Bluetooth is required to scan BLE advertisements (iBeacon & Eddystone)\n'
+              '• Location is required by Android to allow BLE scanning\n\n'
+              'Without these, the app cannot detect beacons around you.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Continue'),
+          ),
+        ],
+      ),
+    );
+
+    // 🟢 Step 2: Request the actual permissions
     final statuses = await [
       Permission.bluetooth,
       Permission.bluetoothScan,
@@ -71,14 +87,19 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
     final permanentlyDenied = statuses.values.any((p) => p.isPermanentlyDenied);
     final locationOn = await Geolocator.isLocationServiceEnabled();
 
+    // 🟢 Step 3: Handle permission outcomes
     if (permanentlyDenied || !locationOn) {
-      await _showRationale(permanentlyDenied: permanentlyDenied, locationOn: locationOn);
+      await _showRationale(
+        permanentlyDenied: permanentlyDenied,
+        locationOn: locationOn,
+      );
     } else if (denied) {
-      _snack('Bluetooth & Location permissions are required.');
+      _snack('Bluetooth & Location permissions are required to start scanning.');
     } else {
       debugPrint('✅ Permissions granted.');
     }
   }
+
 
   Future<void> _showRationale({
     required bool permanentlyDenied,
@@ -113,16 +134,22 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
     );
   }
 
-  //  Beacon Parsing Logic (iBeacon / Eddystone)
-
-  Observation? _parseBeacon(String id, int rssi, List<int> data, {Uuid? serviceUuid}) {
+  // ------------------------------------------------------------
+  // Beacon Parsing (iBeacon / Eddystone)
+  // ------------------------------------------------------------
+  Observation? _parseBeacon(String id, int rssi, List<int> data,
+      {Uuid? serviceUuid}) {
     if (data.isEmpty) return null;
 
     // --- Detect iBeacon packets ---
     for (int i = 0; i <= data.length - 22; i++) {
-      final applePrefix =
-          i + 3 < data.length && data[i] == 0x4C && data[i + 1] == 0x00 && data[i + 2] == 0x02 && data[i + 3] == 0x15;
-      final barePrefix = i + 1 < data.length && data[i] == 0x02 && data[i + 1] == 0x15;
+      final applePrefix = i + 3 < data.length &&
+          data[i] == 0x4C &&
+          data[i + 1] == 0x00 &&
+          data[i + 2] == 0x02 &&
+          data[i + 3] == 0x15;
+      final barePrefix =
+          i + 1 < data.length && data[i] == 0x02 && data[i + 1] == 0x15;
 
       if (applePrefix || barePrefix) {
         final offset = applePrefix ? i + 4 : i + 2;
@@ -143,14 +170,22 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
       }
     }
 
-    // --- Detect Eddystone UID (FrameType = 0x00, UUID FEAA) ---
+    // --- Detect Eddystone UID ---
     if (serviceUuid != null &&
         serviceUuid.toString().toUpperCase().contains('FEAA') &&
         data.isNotEmpty &&
         data[0] == 0x00 &&
         data.length >= 18) {
-      final namespace = data.sublist(2, 12).map((b) => b.toRadixString(16).padLeft(2, '0')).join().toUpperCase();
-      final instance = data.sublist(12, 18).map((b) => b.toRadixString(16).padLeft(2, '0')).join().toUpperCase();
+      final namespace = data
+          .sublist(2, 12)
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join()
+          .toUpperCase();
+      final instance = data
+          .sublist(12, 18)
+          .map((b) => b.toRadixString(16).padLeft(2, '0'))
+          .join()
+          .toUpperCase();
       return Observation(
         id: id,
         type: 'Eddystone',
@@ -169,9 +204,27 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
   }
 
   // ------------------------------------------------------------
-  // 3️⃣ BLE Scanning Logic
+  // Update refresh rate based on scan mode
   // ------------------------------------------------------------
+  void _updateTickForMode(ScanMode mode) {
+    switch (mode) {
+      case ScanMode.lowPower:
+        _uiTick = const Duration(seconds: 3); // ~0.33 Hz
+        break;
+      case ScanMode.balanced:
+        _uiTick = const Duration(seconds: 1); // 1 Hz
+        break;
+      case ScanMode.lowLatency:
+        _uiTick = const Duration(milliseconds: 500); // 2 Hz
+        break;
+      default:
+        _uiTick = const Duration(seconds: 1);
+    }
+  }
 
+  // ------------------------------------------------------------
+  // BLE Scanning Logic
+  // ------------------------------------------------------------
   Future<void> _startScan() async {
     if (_isScanning) return;
 
@@ -180,14 +233,18 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
     setState(() => _isScanning = true);
     _snack('Scanning (${_labelForMode(_scanMode)})');
 
-    // Update UI list at chosen frequency (1 Hz default)
+    // Update refresh rate dynamically
+    _updateTickForMode(_scanMode);
+
+    // Refresh UI periodically
     _uiTicker?.cancel();
     _uiTicker = Timer.periodic(_uiTick, (_) {
       if (!mounted) return;
       setState(() {
         _list
           ..clear()
-          ..addAll(_found.values.toList()..sort((a, b) => b.rssi.compareTo(a.rssi)));
+          ..addAll(_found.values.toList()
+            ..sort((a, b) => b.rssi.compareTo(a.rssi)));
       });
     });
 
@@ -197,19 +254,20 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
           .listen((d) {
         Observation? obs;
 
-        // Try manufacturer data first (iBeacon)
+        // iBeacon detection
         if (d.manufacturerData.isNotEmpty) {
           obs = _parseBeacon(d.id, d.rssi, d.manufacturerData);
         }
 
-        // Try service data (Eddystone)
+        // Eddystone detection
         if (obs == null && d.serviceData.isNotEmpty) {
           for (final entry in d.serviceData.entries) {
-            obs ??= _parseBeacon(d.id, d.rssi, entry.value, serviceUuid: entry.key);
+            obs ??=
+                _parseBeacon(d.id, d.rssi, entry.value, serviceUuid: entry.key);
           }
         }
 
-        // Update if found
+        // Update observation map
         if (obs != null) {
           final existing = _found[d.id];
           _found[d.id] = existing != null
@@ -236,9 +294,8 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
   }
 
   // ------------------------------------------------------------
-  // 4️⃣ UI
+  // UI
   // ------------------------------------------------------------
-
   String _labelForMode(ScanMode m) {
     switch (m) {
       case ScanMode.lowPower:
@@ -273,13 +330,16 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
               items: const [
                 DropdownMenuItem(
                     value: ScanMode.lowPower,
-                    child: Text('Low Power', style: TextStyle(color: Colors.white))),
+                    child: Text('Low Power',
+                        style: TextStyle(color: Colors.white))),
                 DropdownMenuItem(
                     value: ScanMode.balanced,
-                    child: Text('Balanced', style: TextStyle(color: Colors.white))),
+                    child: Text('Balanced',
+                        style: TextStyle(color: Colors.white))),
                 DropdownMenuItem(
                     value: ScanMode.lowLatency,
-                    child: Text('Aggressive', style: TextStyle(color: Colors.white))),
+                    child: Text('Aggressive',
+                        style: TextStyle(color: Colors.white))),
               ],
               onChanged: (mode) async {
                 if (mode == null) return;
@@ -308,8 +368,12 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
           final o = _list[i];
           return ListTile(
             leading: Icon(
-              o.type == 'iBeacon' ? Icons.bluetooth_searching : Icons.radio,
-              color: o.type == 'iBeacon' ? Colors.blueAccent : Colors.orangeAccent,
+              o.type == 'iBeacon'
+                  ? Icons.bluetooth_searching
+                  : Icons.radio,
+              color: o.type == 'iBeacon'
+                  ? Colors.blueAccent
+                  : Colors.orangeAccent,
             ),
             title: Text(
               '${o.type} ${o.info}',
@@ -326,14 +390,18 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
           );
         },
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        backgroundColor: _isScanning ? Colors.redAccent : Colors.greenAccent,
+      floatingActionButton:
+      FloatingActionButton.extended(
+        backgroundColor:
+        _isScanning ? Colors.redAccent : Colors.greenAccent,
         onPressed: _isScanning ? _stopScan : _startScan,
-        icon: Icon(_isScanning ? Icons.stop : Icons.search, color: Colors.black),
+        icon:
+        Icon(_isScanning ? Icons.stop : Icons.search, color: Colors.black),
         label: Text(_isScanning ? 'Stop' : 'Scan',
             style: const TextStyle(color: Colors.black)),
       ),
-      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
+      floatingActionButtonLocation:
+      FloatingActionButtonLocation.centerFloat,
     );
   }
 }
