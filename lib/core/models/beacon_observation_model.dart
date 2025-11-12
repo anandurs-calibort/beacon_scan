@@ -1,5 +1,7 @@
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 
+import '../utils/beacon_utils.dart';
+
 /// Beacon observation model
 // class Observation {
 //   final String id;
@@ -39,4 +41,6 @@ class Observation {
     rssi: rssi ?? this.rssi,
     seenAt: seenAt ?? this.seenAt,
   );
+  num get distance => estimateDistance(rssi);
+
 }
