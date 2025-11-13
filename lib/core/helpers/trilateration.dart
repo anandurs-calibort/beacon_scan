@@ -28,11 +28,3 @@ Offset? trilaterate(BeaconFix a, BeaconFix b, BeaconFix c) {
   return Offset(px + a.pos.dx, py + a.pos.dy);
 }
 
-Offset estimateFromTwo(BeaconFix a, BeaconFix b) {
-  final dx = b.pos.dx - a.pos.dx;
-  final dy = b.pos.dy - a.pos.dy;
-  final d = math.sqrt(dx * dx + dy * dy).clamp(1e-6, double.infinity);
-  final ux = dx / d;
-  final uy = dy / d;
-  return Offset(a.pos.dx + ux * a.dist, a.pos.dy + uy * a.dist);
-}
