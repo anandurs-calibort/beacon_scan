@@ -1,4 +1,3 @@
-import 'dart:math' as math;
 import 'dart:ui';
 import '../models/beacon_fix.dart';
 

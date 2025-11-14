@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 import 'package:geolocator/geolocator.dart';
@@ -11,6 +12,7 @@ import '../core/models/beacon_observation_model.dart';
 import '../core/models/beacon_state.dart';
 import '../core/models/kalman_filter.dart';
 import '../core/utils/beacon_math.dart';
+import '../core/utils/beacon_parser.dart';
 import '../widgets/beacon_tile.dart';
 
 
@@ -22,6 +24,7 @@ class BeaconScannerScreen extends StatefulWidget {
 }
 
 class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
+  final _ble = FlutterReactiveBle();
   StreamSubscription<DiscoveredDevice>? _scanSub;
   Timer? _uiTicker;
 
@@ -149,76 +152,51 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
   // Main processing of observation with smoothing/clamping/outlier filtering
   // -------------------------
   void _processObservation(Observation obs, {double? aoa}) {
-    // calculate raw distance from RSSI using your helper
-    final rawDist = estimateDistanceFromRssi(obs.rssi, txPower: txPower);
+    final rawDist = estimateDistanceFromRssi(obs.rssi);
 
-    // store or update BeaconState
     final existing = _beaconStates[obs.id];
+
+    // First time → create new state
     if (existing == null) {
-      // new beacon
-      final kalman = KalmanFilter1D(estimate: rawDist);
-      final bs = BeaconState(
+      _beaconStates[obs.id] = BeaconState(
         id: obs.id,
         rawDistance: rawDist,
         filteredDistance: rawDist,
         rssi: obs.rssi,
         lastSeen: DateTime.now(),
+        bearing: aoa,
+        ewmaDistance: rawDist,
+        kalmanDistance: rawDist,
+        kalman: KalmanFilter1D(estimate: rawDist),
       );
-      // attach extras on your model (if available fields)
-      try {
-        // attempt to set optional fields if they exist
-        bs.kalman = kalman;
-        bs.bearing = aoa;
-      } catch (_) {}
-      _beaconStates[obs.id] = bs;
-
-      // Auto assign a demo position if you haven't assigned physical coordinates for that id
-      if (!mockBeaconPositions.containsKey(obs.id) && _assignedDemoCount < _demoPositions.length) {
-        mockBeaconPositions[obs.id] = _demoPositions[_assignedDemoCount];
-        _assignedDemoCount++;
-      }
-
-      debugPrint('New beacon detected: ${obs.id} | RSSI: ${obs.rssi} | rawDist: ${rawDist.toStringAsFixed(2)}m AoA:${aoa?.toStringAsFixed(1) ?? "—"}');
-    } else {
-      double filtered;
-      if (useKalman) {
-        try {
-          existing.kalman ??= KalmanFilter1D(estimate: existing.filteredDistance);
-          filtered = existing.kalman!.update(rawDist);
-        } catch (_) {
-          filtered = ewma(existing.filteredDistance, rawDist, alpha);
-        }
-      } else {
-        filtered = ewma(existing.filteredDistance, rawDist, alpha);
-      }
-
-      // clamp jumps
-      filtered = clampJump(existing.filteredDistance, filtered, maxJump);
-
-      // update fields
-      existing.update(obs.rssi, rawDist);
-      existing.filteredDistance = filtered;
-      // overwrite AoA if present (beacon advert AoA is authoritative)
-      if (aoa != null) {
-        existing.bearing = aoa;
-      }
-      existing.lastSeen = DateTime.now();
-
-      debugPrint(
-          '[${useKalman ? "Kalman" : "EWMA"}] '
-              '${obs.type} ${obs.id}: '
-              'RSSI ${obs.rssi}dBm → '
-              'raw ${rawDist.toStringAsFixed(2)}m → '
-              'filtered ${filtered.toStringAsFixed(2)}m '
-              '${aoa != null ? "AoA ${aoa.toStringAsFixed(1)}°" : ""}'
-      );
+      return;
     }
 
-    // keep observation map for UI display (distance in list should reflect filtered distance later)
-    _found[obs.id] = _found[obs.id] != null
-        ? _found[obs.id]!.copyUpdated(rssi: obs.rssi, seenAt: obs.seenAt)
-        : obs;
+    // EWMA
+    final ewmaValue = ewma(existing.ewmaDistance, rawDist, alpha);
+
+    // Kalman
+    existing.kalman ??= KalmanFilter1D(estimate: existing.kalmanDistance);
+    final kalmanValue = existing.kalman!.update(rawDist);
+
+    // Clamp
+    final ewmaClamped = clampJump(existing.ewmaDistance, ewmaValue, maxJump);
+    final kalmanClamped = clampJump(existing.kalmanDistance, kalmanValue, maxJump);
+
+    // 🔥 FIX: CREATE A NEW INSTANCE (DO NOT MUTATE EXISTING)
+    _beaconStates[obs.id] = BeaconState(
+      id: existing.id,
+      rawDistance: rawDist,
+      filteredDistance: useKalman ? kalmanClamped : ewmaClamped,
+      rssi: obs.rssi,
+      lastSeen: DateTime.now(),
+      bearing: aoa ?? existing.bearing,
+      ewmaDistance: ewmaClamped,
+      kalmanDistance: kalmanClamped,
+      kalman: existing.kalman, // keep filter instance
+    );
   }
+
 
   // -------------------------
   // Position update (use only best 3 beacons for trilateration)
@@ -227,7 +205,9 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
     final now = DateTime.now();
     final fixes = <BeaconFix>[];
 
-    // 1️⃣ Collect valid, non-stale, non-weak beacons
+    // --------------------------------------------------
+    // 1️⃣ COLLECT VALID BEACONS
+    // --------------------------------------------------
     for (final entry in _beaconStates.entries) {
       final id = entry.key;
       final state = entry.value;
@@ -240,66 +220,135 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
       fixes.add(BeaconFix(pos, state.filteredDistance));
     }
 
-    // 2️⃣ Sort beacons by distance
+    // Sort beacons by closeness (best distances first)
     fixes.sort((a, b) => a.dist.compareTo(b.dist));
 
-    // 3️⃣ Handle cases by beacon count
+    debugPrint("---- Valid fixes (${fixes.length}) ----");
+    for (var f in fixes) {
+      debugPrint("Beacon @ ${f.pos} dist=${f.dist.toStringAsFixed(3)}m");
+    }
+
+    // --------------------------------------------------
+    // 2️⃣ HANDLE CASES
+    // --------------------------------------------------
+
     if (fixes.isEmpty) {
       _userPosition = null;
       _accuracy = "No beacons detected";
       _beaconsUsed = 0;
-      debugPrint('No valid beacons found for triangulation.');
-    } else if (fixes.length == 1) {
+      setState(() {});
+      return;
+    }
+
+    if (fixes.length == 1) {
       _userPosition = null;
       _accuracy = "Very poorly accurate (1 beacon)";
       _beaconsUsed = 1;
-      debugPrint('Only 1 beacon available, cannot trilaterate.');
-    } else if (fixes.length == 2) {
-      // Use helper → estimate midpoint projection
+      setState(() {});
+      return;
+    }
+
+    if (fixes.length == 2) {
       _userPosition = estimateFromTwo(fixes[0], fixes[1]);
       _accuracy = "Medium accuracy (2 beacons)";
       _beaconsUsed = 2;
-      debugPrint('Estimated position (2 beacons): $_userPosition');
-    } else {
-      //  Use trilateration from your utils
-      final best = fixes.take(3).toList();
-      final trilaterated = trilaterate(best[0], best[1], best[2]);
-
-      //  Optional AoA refinement (use combineDistanceAndBearing)
-      final withAoA = _beaconStates.values
-          .where((b) => b.bearing != null && mockBeaconPositions[b.id] != null)
-          .take(3)
-          .toList();
-
-      if (withAoA.length >= 2) {
-        final refined = combineDistanceAndBearing(
-          {for (var b in withAoA) b.id: BeaconFix(mockBeaconPositions[b.id]!, b.filteredDistance)},
-          {for (var b in withAoA) b.id: b.bearing!},
-        );
-
-        if (refined != null) {
-          _userPosition = trilaterated != null
-              ? Offset(
-            (trilaterated.dx + refined.dx) / 2,
-            (trilaterated.dy + refined.dy) / 2,
-          )
-              : refined;
-          debugPrint(" AoA refined position → $_userPosition");
-        } else {
-          _userPosition = trilaterated;
-        }
-      } else {
-        _userPosition = trilaterated;
-      }
-
-      _accuracy = "Highly accurate (3+ beacons)";
-      _beaconsUsed = fixes.length;
-      debugPrint(' Trilaterated using ${best.length} beacons → Pos: $_userPosition');
+      setState(() {});
+      return;
     }
 
-    // 6️⃣ Always refresh UI
+    // --------------------------------------------------
+    // 3️⃣ TRILATERATION (PRIMARY SOURCE)
+    // --------------------------------------------------
+    final best = fixes.take(3).toList();
+    debugPrint("Using 3 beacons for trilateration:");
+
+    for (var b in best) {
+      debugPrint("  pos=${b.pos} dist=${b.dist.toStringAsFixed(3)}");
+    }
+
+    Offset? trilaterated = trilaterate(best[0], best[1], best[2]);
+
+    if (trilaterated == null) {
+      debugPrint("❌ Trilateration failed — using only AoA solution if possible");
+    } else {
+      debugPrint("🎯 Trilateration → $trilaterated");
+    }
+
+    // --------------------------------------------------
+    // 4️⃣ AoA IMPROVEMENT (SECONDARY REFINEMENT)
+    // --------------------------------------------------
+    final aoaBeacons = _beaconStates.values
+        .where((b) => b.bearing != null && mockBeaconPositions[b.id] != null)
+        .toList();
+
+    if (aoaBeacons.isEmpty) {
+      // No AoA — return trilateration only
+      _userPosition = trilaterated;
+      _accuracy = "Highly accurate (3+ distance beacons)";
+      _beaconsUsed = fixes.length;
+      setState(() {});
+      return;
+    }
+
+    debugPrint("🔧 Refining using AoA (${aoaBeacons.length} beacons)…");
+
+    // --------------------------------------------------
+    // 4A: Convert each AoA to a point estimation
+    // --------------------------------------------------
+    final aoaPoints = <Offset>[];
+
+    for (final b in aoaBeacons) {
+      final origin = mockBeaconPositions[b.id]!;
+      final point = bearingToPoint(origin, b.bearing!, b.filteredDistance);
+
+      debugPrint("🧭 AoA→Point | origin:$origin  bearing:${b.bearing}°  "
+          "dist:${b.filteredDistance.toStringAsFixed(3)} → point:$point");
+
+      aoaPoints.add(point);
+    }
+
+    // --------------------------------------------------
+    // 4B: Compute AoA average (centroid)
+    // --------------------------------------------------
+    Offset aoaAvg = Offset.zero;
+    for (final p in aoaPoints) {
+      aoaAvg = Offset(aoaAvg.dx + p.dx, aoaAvg.dy + p.dy);
+    }
+    aoaAvg = Offset(aoaAvg.dx / aoaPoints.length, aoaAvg.dy / aoaPoints.length);
+
+    debugPrint("📍 AoA average point → $aoaAvg");
+
+    // --------------------------------------------------
+    // 5️⃣ FUSION (SUPERIOR ACCURACY)
+    // --------------------------------------------------
+
+    // If trilateration exists → combine both using weighted fusion:
+    // Trilateration = 70% weight (more reliable)
+    // AoA = 30% weight (direction improvement)
+    Offset finalPos;
+
+    if (trilaterated != null) {
+      finalPos = Offset(
+        trilaterated.dx * 0.7 + aoaAvg.dx * 0.3,
+        trilaterated.dy * 0.7 + aoaAvg.dy * 0.3,
+      );
+    } else {
+      // Trilateration failed → use purely AoA
+      finalPos = aoaAvg;
+    }
+
+    // --------------------------------------------------
+    // 6️⃣ FINAL UPDATE
+    // --------------------------------------------------
+    _userPosition = finalPos;
+    _accuracy = "Highly accurate (Distance + AoA fused)";
+    _beaconsUsed = fixes.length;
+
+    debugPrint("🎯 FINAL USER POSITION → $_userPosition");
+
     setState(() {});
   }
+
 
   bool useDummyBeacons = true;
   void _simulateRssiFluctuation() {
@@ -317,40 +366,52 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
         updateInterval = const Duration(seconds: 1);
     }
 
-    debugPrint('Dummy simulation interval: ${updateInterval.inMilliseconds}ms');
-
-    // Create periodic timer — it auto-stops when _isScanning becomes false
     Timer.periodic(updateInterval, (timer) {
       if (!_isScanning) {
-        timer.cancel(); // ✅ stop the periodic loop
-        debugPrint('Dummy simulation stopped.');
+        timer.cancel();
         return;
       }
 
       for (final entry in _beaconStates.entries) {
         final beacon = entry.value;
 
-        // Simulate ±5 dBm fluctuation
-        final noise = (random.nextDouble() * 10) - 5;
+        // ------------------------------------------------
+        // REALISTIC BLE NOISE: ±3 dBm random fluctuation
+        // ------------------------------------------------
+        final noise = (random.nextDouble() * 6) - 3; // -3 to +3
         final newRssi = (beacon.rssi + noise).round();
-        final newDistance = estimateDistanceFromRssi(newRssi, txPower: -59);
 
-        // Update observation
-        final obs = Observation(
-          id: beacon.id,
-          type: _found[beacon.id]?.type ?? 'Eddystone',
-          info: _found[beacon.id]?.info ?? '',
+        // Update observation used by UI
+        _found[beacon.id] = _found[beacon.id]?.copyUpdated(
           rssi: newRssi,
           seenAt: DateTime.now(),
-        );
+        ) ??
+            Observation(
+              id: beacon.id,
+              type: 'Eddystone',
+              info: '',
+              rssi: newRssi,
+              seenAt: DateTime.now(),
+            );
 
-        _processObservation(obs, aoa: beacon.bearing);
+        // Refresh list for UI sorting
+        _list
+          ..clear()
+          ..addAll(_found.values.toList()
+            ..sort((a, b) => b.rssi.compareTo(a.rssi)));
+
+        // Filter the distance
+        _processObservation(_found[beacon.id]!, aoa: beacon.bearing);
       }
 
+      // Recalculate user position
       _updateUserPosition();
+
+      // Update UI
       setState(() {});
     });
   }
+
 
 
 
@@ -431,11 +492,11 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
   Future<void> _startScan() async {
     if (_isScanning) return;
 
-    // 🟡 Step 1: Ensure permissions first
-    final ok = await _ensurePermissions();
-    if (!ok) return; // ❌ Stop immediately if not allowed
+    // Step 1 — Check permissions (no dialog spam)
+    final ok = await _ensurePermissions(showRationaleIfNeeded: true);
+    if (!ok) return;
 
-    // 🟢 Step 2: Prepare scanning state
+    // Step 2 — Reset scanning data
     _found.clear();
     _list.clear();
     _beaconStates.clear();
@@ -443,9 +504,9 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
     _assignedDemoCount = 0;
 
     setState(() => _isScanning = true);
-    debugPrint('Starting scan mode: $_scanMode');
+    debugPrint("🚀 Scan started | Mode: $_scanMode");
 
-    // 🕓 Step 3: Periodic UI refresh for position updates
+    // Step 3 — Start periodic UI updater
     _uiTicker?.cancel();
     _uiTicker = Timer.periodic(_uiTick, (_) {
       if (!mounted || !_isScanning) return;
@@ -453,79 +514,98 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
       setState(() {
         _list
           ..clear()
-          ..addAll(_found.values.toList()..sort((a, b) => b.rssi.compareTo(a.rssi)));
+          ..addAll(_found.values.toList()
+            ..sort((a, b) => b.rssi.compareTo(a.rssi)));
       });
     });
 
-    // 🔹 Step 4: Use dummy data for mock scanning
+    // Step 4 — Dummy mode ON
     const bool useDummyBeacons = true;
-
     if (useDummyBeacons) {
-      debugPrint('Using dummy beacons instead of real BLE scan');
+      debugPrint("🧪 Using dummy beacons...");
       _loadDummyBeacons();
       return;
     }
 
-    // 🟣 Step 5: Real BLE scan (kept commented for later)
-    // try {
-    //   _scanSub = _ble.scanForDevices(withServices: [], scanMode: _scanMode).listen(
-    //     (d) {
-    //       final obs = _parseAdvertisement(
-    //         id: d.id,
-    //         rssi: d.rssi,
-    //         manufacturerData: (d.manufacturerData is Uint8List)
-    //             ? d.manufacturerData as Uint8List
-    //             : (d.manufacturerData != null
-    //                 ? Uint8List.fromList(List<int>.from(d.manufacturerData as List<int>))
-    //                 : null),
-    //         serviceData: (d.serviceData is Map<Uuid, Uint8List>)
-    //             ? Map<Uuid, Uint8List>.from(d.serviceData as Map<Uuid, Uint8List>)
-    //             : (d.serviceData != null
-    //                 ? Map<Uuid, Uint8List>.from(
-    //                     (d.serviceData as Map).map((k, v) => MapEntry(
-    //                           k as Uuid,
-    //                           Uint8List.fromList(List<int>.from(v as List<int>)),
-    //                         )),
-    //                   )
-    //                 : null),
-    //       );
+    // Step 5 — Real BLE scan (disabled for now)
+    try {
+      _scanSub = _ble
+          .scanForDevices(withServices: [], scanMode: _scanMode)
+          .listen((d) {
+        final obs = parseAdvertisement(
+          id: d.id,
+          rssi: d.rssi,
+          manufacturerData: d.manufacturerData is Uint8List
+              ? d.manufacturerData as Uint8List
+              : (d.manufacturerData != null
+              ? Uint8List.fromList(
+              List<int>.from(d.manufacturerData as List<int>))
+              : null),
+          serviceData: d.serviceData is Map<Uuid, Uint8List>
+              ? Map<Uuid, Uint8List>.from(d.serviceData)
+              : (d.serviceData != null
+              ? Map<Uuid, Uint8List>.from(
+            (d.serviceData as Map).map(
+                  (k, v) => MapEntry(
+                k as Uuid,
+                Uint8List.fromList(List<int>.from(v)),
+              ),
+            ),
+          )
+              : null),
+        );
 
-    //       if (obs != null) {
-    //         double? aoa;
-    //         try {
-    //           if (d.manufacturerData != null && (d.manufacturerData as Uint8List).isNotEmpty) {
-    //             aoa = _tryExtractAoAFromBytes(List<int>.from(d.manufacturerData as Uint8List));
-    //           }
-    //         } catch (_) {}
+        if (obs == null) {
+          // Unknown BLE device
+          final unk = Observation(
+            id: d.id,
+            type: "BLE",
+            info: "(raw)",
+            rssi: d.rssi,
+            seenAt: DateTime.now(),
+          );
 
-    //         if (aoa == null && d.serviceData != null) {
-    //           for (final e in d.serviceData.entries) {
-    //             aoa ??= _tryExtractAoAFromBytes(List<int>.from(e.value));
-    //             if (aoa != null) break;
-    //           }
-    //         }
+          _found[d.id] =
+              _found[d.id]?.copyUpdated(rssi: unk.rssi, seenAt: unk.seenAt) ??
+                  unk;
 
-    //         final existing = _found[d.id];
-    //         _found[d.id] = existing != null
-    //             ? existing.copyUpdated(rssi: obs.rssi, seenAt: obs.seenAt)
-    //             : obs;
+          return;
+        }
 
-    //         _processObservation(obs, aoa: aoa);
-    //       } else {
-    //         final unk = Observation(
-    //             id: d.id, type: 'BLE', info: '(raw)', rssi: d.rssi, seenAt: DateTime.now());
-    //         final existing = _found[d.id];
-    //         _found[d.id] = existing != null
-    //             ? existing.copyUpdated(rssi: unk.rssi, seenAt: unk.seenAt)
-    //             : unk;
-    //       }
-    //     },
-    //     onError: (e) => debugPrint(' Scan error: $e'),
-    //   );
-    // } catch (e) {
-    //   _snack('Error: $e');
-    // }
+        // AoA extraction
+        double? aoa;
+        try {
+          if (d.manufacturerData != null &&
+              (d.manufacturerData as Uint8List).isNotEmpty) {
+            aoa = tryExtractAoAFromBytes(
+              List<int>.from(d.manufacturerData as Uint8List),
+            );
+          }
+        } catch (_) {}
+
+        if (aoa == null && d.serviceData != null) {
+          for (var e in d.serviceData.entries) {
+            aoa = tryExtractAoAFromBytes(List<int>.from(e.value));
+            if (aoa != null) break;
+          }
+        }
+
+        // Update UI list
+        final existing = _found[d.id];
+        _found[d.id] = existing != null
+            ? existing.copyUpdated(rssi: obs.rssi, seenAt: obs.seenAt)
+            : obs;
+
+        // Process distance filtering
+        _processObservation(obs, aoa: aoa);
+      }, onError: (e) {
+        debugPrint("❌ Scan error: $e");
+      });
+    } catch (e) {
+      _snack("Error: $e");
+    }
   }
+
 
 
 
@@ -550,51 +630,32 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
         actions: [
-
+          DropdownButtonHideUnderline(
+            child: DropdownButton<ScanMode>(
+              dropdownColor: Colors.grey[900],
+              value: _scanMode,
+              icon: const Icon(Icons.tune, color: Colors.white),
+              items: const [
+                DropdownMenuItem(value: ScanMode.lowPower, child: Text('Low Power', style: TextStyle(color: Colors.white))),
+                DropdownMenuItem(value: ScanMode.balanced, child: Text('Balanced', style: TextStyle(color: Colors.white))),
+                DropdownMenuItem(value: ScanMode.lowLatency, child: Text('Aggressive', style: TextStyle(color: Colors.white))),
+              ],
+              onChanged: (mode) async {
+                if (mode == null) return;
+                setState(() => _scanMode = mode);
+                debugPrint('Scan mode changed to: $_scanMode');
+                if (_isScanning) {
+                  await _stopScan();
+                  await Future.delayed(const Duration(milliseconds: 200));
+                  await _startScan();
+                }
+              },
+            ),
+          ),
         ],
       ),
       body: Column(
         children: [
-          SizedBox(height: 100,child: Row(mainAxisAlignment:MainAxisAlignment.spaceEvenly,children: [
-            DropdownButtonHideUnderline(
-              child: DropdownButton<ScanMode>(
-                dropdownColor: Colors.grey[900],
-                value: _scanMode,
-                icon: const Icon(Icons.tune, color: Colors.white),
-                items: const [
-                  DropdownMenuItem(value: ScanMode.lowPower, child: Text('Low Power', style: TextStyle(color: Colors.white))),
-                  DropdownMenuItem(value: ScanMode.balanced, child: Text('Balanced', style: TextStyle(color: Colors.white))),
-                  DropdownMenuItem(value: ScanMode.lowLatency, child: Text('Aggressive', style: TextStyle(color: Colors.white))),
-                ],
-                onChanged: (mode) async {
-                  if (mode == null) return;
-                  setState(() => _scanMode = mode);
-                  debugPrint('Scan mode changed to: $_scanMode');
-                  if (_isScanning) {
-                    await _stopScan();
-                    await Future.delayed(const Duration(milliseconds: 200));
-                    await _startScan();
-                  }
-                },
-              ),
-            ),
-            DropdownButtonHideUnderline(
-              child: DropdownButton<bool>(
-                dropdownColor: Colors.grey[900],
-                value: useKalman,
-                icon: const Icon(Icons.filter_alt, color: Colors.white),
-                items: const [
-                  DropdownMenuItem(value: false, child: Text('EWMA', style: TextStyle(color: Colors.white))),
-                  DropdownMenuItem(value: true, child: Text('Kalman', style: TextStyle(color: Colors.white))),
-                ],
-                onChanged: (v) {
-                  if (v == null) return;
-                  setState(() => useKalman = v);
-                  debugPrint('Filter changed → ${useKalman ? "Kalman" : "EWMA"}');
-                },
-              ),
-            ),
-          ],),),
           Container(
             width: double.infinity,
             color: Colors.grey[900],
@@ -621,6 +682,7 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
                 final o = _list[i];
                 final state = _beaconStates[o.id];
                 return BeaconTile(
+                  position: mockBeaconPositions[o.id],
                   observation: o,
                   state: state,
                 );

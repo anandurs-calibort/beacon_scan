@@ -12,7 +12,7 @@ import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 
 import '../models/beacon_observation_model.dart';
 
-Observation? _parseAdvertisement({
+Observation? parseAdvertisement({
   required String id,
   required int rssi,
   required Uint8List? manufacturerData,
@@ -53,7 +53,7 @@ Observation? _parseAdvertisement({
           final uuid = _bytesToUuid(uuidBytes);
 
           // Try read AoA from manufacturer trailing bytes (if any)
-          final aoa = _tryExtractAoAFromBytes(manu);
+          final aoa = tryExtractAoAFromBytes(manu);
 
           debugPrint('✅ [iBeacon Detected] $id  UUID:$uuid major:$major minor:$minor rssi:$rssi AoA:${aoa?.toStringAsFixed(1) ?? "—"}');
           final obs = Observation(id: id, type: 'iBeacon', info: '($uuid / $major / $minor)', rssi: rssi, seenAt: DateTime.now());
@@ -76,7 +76,7 @@ Observation? _parseAdvertisement({
           // UID frame
           final namespace = bytes.sublist(2, 12).map((b) => b.toRadixString(16).padLeft(2, '0')).join().toUpperCase();
           final instance = bytes.sublist(12, 18).map((b) => b.toRadixString(16).padLeft(2, '0')).join().toUpperCase();
-          final aoa = _tryExtractAoAFromBytes(bytes);
+          final aoa = tryExtractAoAFromBytes(bytes);
 
           debugPrint('✅ [Eddystone UID] $id  namespace:$namespace instance:$instance rssi:$rssi AoA:${aoa?.toStringAsFixed(1) ?? "—"}');
           return Observation(id: id, type: 'Eddystone', info: '($namespace / $instance)', rssi: rssi, seenAt: DateTime.now());
@@ -93,7 +93,7 @@ Observation? _parseAdvertisement({
 
 
 // Extract AoA from raw byte array (some beacons append angle in last two bytes as little-endian tenths of degree)
-double? _tryExtractAoAFromBytes(List<int> bytes) {
+double? tryExtractAoAFromBytes(List<int> bytes) {
   // check last 2 bytes
   if (bytes.length >= 2) {
     final v = (bytes[bytes.length - 2] & 0xFF) | ((bytes[bytes.length - 1] & 0xFF) << 8);

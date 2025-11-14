@@ -11,13 +11,16 @@ Offset estimateFromTwo(BeaconFix a, BeaconFix b) {
   final uy = dy / d;
   return Offset(a.pos.dx + ux * a.dist, a.pos.dy + uy * a.dist);
 }
-
-// 🧭 Convert bearing + distance to a point
+/// 🧭 Convert bearing + distance to a point
 Offset bearingToPoint(Offset origin, double bearingDeg, double dist) {
   final rad = bearingDeg * math.pi / 180.0;
-  return Offset(origin.dx + dist * math.cos(rad), origin.dy + dist * math.sin(rad));
-}
+  final p = Offset(origin.dx + dist * math.cos(rad), origin.dy + dist * math.sin(rad));
 
+  debugPrint(
+      "🧭 AoA→Point | origin:(${origin.dx},${origin.dy})  bearing:$bearingDeg°  dist:${dist.toStringAsFixed(2)} → point:(${p.dx.toStringAsFixed(2)}, ${p.dy.toStringAsFixed(2)})");
+
+  return p;
+}
 // 🧮 Combine multiple beacons using distance + bearing
 Offset? combineDistanceAndBearing(Map<String, BeaconFix> fixes, Map<String, double> bearings) {
   final points = <Offset>[];

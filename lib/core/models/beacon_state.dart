@@ -1,14 +1,16 @@
 import 'kalman_filter.dart';
-
 class BeaconState {
   final String id;
   double rawDistance;
-  double filteredDistance;
+  double filteredDistance; // the one currently used by logic
+  double? bearing;
   int rssi;
   DateTime lastSeen;
-  double? bearing; // Angle of Arrival in degrees (optional)
-  KalmanFilter1D? kalman; // One Kalman instance per beacon
 
+  // NEW:
+  double ewmaDistance;
+  double kalmanDistance;
+  KalmanFilter1D? kalman;
 
   BeaconState({
     required this.id,
@@ -16,8 +18,13 @@ class BeaconState {
     required this.filteredDistance,
     required this.rssi,
     required this.lastSeen,
+    this.bearing,
+    this.kalman,
+    double? ewmaDistance,
+    double? kalmanDistance,
+  })  : ewmaDistance = ewmaDistance ?? rawDistance,
+        kalmanDistance = kalmanDistance ?? rawDistance;
 
-  });
 
   void update(int newRssi, double newDistance) {
     rssi = newRssi;
