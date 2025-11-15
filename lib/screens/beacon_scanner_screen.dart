@@ -65,65 +65,137 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _ensurePermissions(showRationaleIfNeeded: false));
   }
   Future<bool> _ensurePermissions({bool showRationaleIfNeeded = true}) async {
-    // 🔹 First, check if permissions are already granted
-    final bluetoothGranted = await Permission.bluetooth.isGranted;
-    final scanGranted = await Permission.bluetoothScan.isGranted;
-    final connectGranted = await Permission.bluetoothConnect.isGranted;
+    // =====================================================
+    // 1️⃣ CHECK PERMISSIONS FIRST
+    // =====================================================
+    final bluetoothScan = await Permission.bluetoothScan.isGranted;
+    final bluetoothConnect = await Permission.bluetoothConnect.isGranted;
     final locationGranted = await Permission.locationWhenInUse.isGranted;
-    final locationOn = await Geolocator.isLocationServiceEnabled();
 
-    // ✅ All good — no need to show dialog again
-    if (bluetoothGranted && scanGranted && connectGranted && locationGranted && locationOn) {
-      debugPrint('✅ Permissions already granted.');
-      return true;
+    final permsOk = bluetoothScan && bluetoothConnect && locationGranted;
+
+    if (!permsOk) {
+      if (showRationaleIfNeeded) {
+        await showDialog(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text("Permissions Required"),
+            content: const Text(
+              "This app needs:\n"
+                  "• Bluetooth permission to scan nearby beacons\n"
+                  "• Location permission (required by Android for BLE scanning)\n\n"
+                  "These permissions are different from the ON/OFF toggles.",
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text("Continue"),
+              )
+            ],
+          ),
+        );
+      }
+
+      final result = await [
+        Permission.bluetoothScan,
+        Permission.bluetoothConnect,
+        Permission.locationWhenInUse,
+      ].request();
+
+      if (result.values.any((e) => e.isPermanentlyDenied)) {
+        await showDialog(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text("Permissions Blocked"),
+            content: const Text(
+              "Bluetooth or Location permissions are permanently denied.\n"
+                  "Please enable them manually from Settings.",
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(ctx);
+                  openAppSettings();
+                },
+                child: const Text("Open Settings"),
+              ),
+            ],
+          ),
+        );
+        return false;
+      }
+
+      if (result.values.any((e) => e.isDenied)) {
+        _snack("Bluetooth & Location permissions required.");
+        return false;
+      }
     }
 
-    // 🔹 If not granted and allowed to show rationale
-    if (showRationaleIfNeeded) {
+    // =====================================================
+    // 2️⃣ CHECK LOCATION TOGGLE (ON/OFF)
+    // =====================================================
+    final locationOn = await Geolocator.isLocationServiceEnabled();
+    if (!locationOn) {
       await showDialog(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('Permission Required'),
+          title: const Text("Location Required"),
           content: const Text(
-            'This app needs Bluetooth and Location permissions to detect nearby beacons.\n\n'
-                '• Bluetooth is required to scan BLE advertisements (iBeacon & Eddystone)\n'
-                '• Location is required by Android to allow BLE scanning\n\n'
-                'Without these, the app cannot detect beacons around you.',
+            "Location Services are turned OFF.\n\n"
+                "Android requires Location Services to be ON to scan BLE beacons "
+                "(even if the app does not use GPS).",
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Continue')),
+            TextButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                Geolocator.openLocationSettings();
+              },
+              child: const Text("Open Location Settings"),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text("Cancel"),
+            ),
           ],
         ),
       );
-    }
-
-    // 🔹 Now actually request permissions
-    final statuses = await [
-      Permission.bluetooth,
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.locationWhenInUse,
-    ].request();
-
-    final denied = statuses.values.any((p) => p.isDenied);
-    final permanentlyDenied = statuses.values.any((p) => p.isPermanentlyDenied);
-
-    if (permanentlyDenied || !locationOn) {
-      setState(() => _isScanning = false);
-      await _showRationale(permanentlyDenied: permanentlyDenied, locationOn: locationOn);
-      _snack('Bluetooth or Location is not enabled. Please enable them to start scanning.');
       return false;
     }
 
-    if (denied) {
-      setState(() => _isScanning = false);
-      _snack('Bluetooth & Location permissions are required to start scanning.');
+    // =====================================================
+    // 3️⃣ CHECK BLUETOOTH TOGGLE (ON/OFF)
+    // =====================================================
+    final bleState = await _ble.statusStream.first;
+    if (bleState != BleStatus.ready) {
+      await showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text("Bluetooth Required"),
+          content: const Text(
+            "Bluetooth is currently turned OFF.\n"
+                "Please turn ON Bluetooth to scan for beacons.",
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                FlutterReactiveBle().logLevel;
+                // (no cross-platform BT settings opener available in Flutter)
+              },
+              child: const Text("OK"),
+            ),
+          ],
+        ),
+      );
       return false;
     }
 
-    debugPrint('✅ Permissions granted after request.');
+    // Everything OK
+    debugPrint("✅ Permissions + Toggles OK");
     return true;
   }
+
 
 
   Future<void> _showRationale({required bool permanentlyDenied, required bool locationOn}) async {
