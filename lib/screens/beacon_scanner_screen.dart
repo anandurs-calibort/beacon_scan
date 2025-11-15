@@ -48,7 +48,6 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
     const Offset(0, 0),
     const Offset(4, 0),
     const Offset(2, 3),
-    const Offset(5, 2),
   ];
   int _assignedDemoCount = 0;
 
@@ -65,9 +64,9 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _ensurePermissions(showRationaleIfNeeded: false));
   }
   Future<bool> _ensurePermissions({bool showRationaleIfNeeded = true}) async {
-    // =====================================================
-    // 1️⃣ CHECK PERMISSIONS FIRST
-    // =====================================================
+    // ---------------------------------------------------------
+    // 1️⃣ CHECK PERMISSIONS (no Bluetooth toggle check here)
+    // ---------------------------------------------------------
     final bluetoothScan = await Permission.bluetoothScan.isGranted;
     final bluetoothConnect = await Permission.bluetoothConnect.isGranted;
     final locationGranted = await Permission.locationWhenInUse.isGranted;
@@ -82,9 +81,9 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
             title: const Text("Permissions Required"),
             content: const Text(
               "This app needs:\n"
-                  "• Bluetooth permission to scan nearby beacons\n"
+                  "• Bluetooth permission to scan beacons\n"
                   "• Location permission (required by Android for BLE scanning)\n\n"
-                  "These permissions are different from the ON/OFF toggles.",
+                  "These are different from Bluetooth/Location ON-OFF toggles.",
             ),
             actions: [
               TextButton(
@@ -109,7 +108,7 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
             title: const Text("Permissions Blocked"),
             content: const Text(
               "Bluetooth or Location permissions are permanently denied.\n"
-                  "Please enable them manually from Settings.",
+                  "Please enable them from Settings.",
             ),
             actions: [
               TextButton(
@@ -131,9 +130,9 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
       }
     }
 
-    // =====================================================
-    // 2️⃣ CHECK LOCATION TOGGLE (ON/OFF)
-    // =====================================================
+    // ---------------------------------------------------------
+    // 2️⃣ CHECK LOCATION ON/OFF
+    // ---------------------------------------------------------
     final locationOn = await Geolocator.isLocationServiceEnabled();
     if (!locationOn) {
       await showDialog(
@@ -141,9 +140,8 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
         builder: (ctx) => AlertDialog(
           title: const Text("Location Required"),
           content: const Text(
-            "Location Services are turned OFF.\n\n"
-                "Android requires Location Services to be ON to scan BLE beacons "
-                "(even if the app does not use GPS).",
+            "Location Services are OFF.\n\n"
+                "Android requires Location Services to be ON for BLE scanning.",
           ),
           actions: [
             TextButton(
@@ -163,57 +161,26 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
       return false;
     }
 
-    // =====================================================
-    // 3️⃣ CHECK BLUETOOTH TOGGLE (ON/OFF)
-    // =====================================================
-    final bleState = await _ble.statusStream.first;
-    if (bleState != BleStatus.ready) {
-      await showDialog(
-        context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text("Bluetooth Required"),
-          content: const Text(
-            "Bluetooth is currently turned OFF.\n"
-                "Please turn ON Bluetooth to scan for beacons.",
-          ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.pop(ctx);
-                FlutterReactiveBle().logLevel;
-                // (no cross-platform BT settings opener available in Flutter)
-              },
-              child: const Text("OK"),
-            ),
-          ],
-        ),
-      );
-      return false;
-    }
+    // ---------------------------------------------------------
+    // (NO BLUETOOTH POWER CHECK HERE!)
+    // ---------------------------------------------------------
 
-    // Everything OK
-    debugPrint("✅ Permissions + Toggles OK");
+    debugPrint("✅ Permissions + Location Toggle OK");
     return true;
   }
 
 
-
-  Future<void> _showRationale({required bool permanentlyDenied, required bool locationOn}) async {
-    await showDialog(
+  void _showBluetoothOffDialog() {
+    showDialog(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('Permissions & Location needed'),
-        content: Text(
-          '${!locationOn ? '• Turn on Location Services\n' : ''}'
-              '${permanentlyDenied ? '• Enable Bluetooth & Location in Settings.\n' : '• Allow Bluetooth & Location to scan for beacons.\n'}'
-              'Scanning uses Bluetooth LE advertisements (no pairing).',
-        ),
+        title: const Text("Bluetooth Required"),
+        content: const Text("Please turn ON Bluetooth to start scanning."),
         actions: [
-          if (!locationOn)
-            TextButton(onPressed: () => Geolocator.openLocationSettings(), child: const Text('Open Location Settings')),
-          if (permanentlyDenied)
-            TextButton(onPressed: () => openAppSettings(), child: const Text('Open App Settings')),
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('OK')),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text("OK"),
+          )
         ],
       ),
     );
@@ -564,11 +531,38 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
   Future<void> _startScan() async {
     if (_isScanning) return;
 
-    // Step 1 — Check permissions (no dialog spam)
+    // ---------------------------------------------------------
+    // 1️⃣ Check permissions & location (NO BT check)
+    // ---------------------------------------------------------
     final ok = await _ensurePermissions(showRationaleIfNeeded: true);
     if (!ok) return;
 
-    // Step 2 — Reset scanning data
+    // ---------------------------------------------------------
+    // 2️⃣ Bluetooth ON/OFF Check (correct place)
+    // ---------------------------------------------------------
+    final bleState = _ble.status; // immediate status – safe here
+    if (bleState != BleStatus.ready) {
+      await showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text("Bluetooth Required"),
+          content: const Text(
+            "Bluetooth is OFF.\nPlease turn ON Bluetooth to start scanning.",
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text("OK"),
+            )
+          ],
+        ),
+      );
+      return;
+    }
+
+    // ---------------------------------------------------------
+    // 3️⃣ Reset scanning data
+    // ---------------------------------------------------------
     _found.clear();
     _list.clear();
     _beaconStates.clear();
@@ -578,10 +572,13 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
     setState(() => _isScanning = true);
     debugPrint("🚀 Scan started | Mode: $_scanMode");
 
-    // Step 3 — Start periodic UI updater
+    // ---------------------------------------------------------
+    // 4️⃣ UI periodic updater
+    // ---------------------------------------------------------
     _uiTicker?.cancel();
     _uiTicker = Timer.periodic(_uiTick, (_) {
       if (!mounted || !_isScanning) return;
+
       _updateUserPosition();
       setState(() {
         _list
@@ -591,15 +588,18 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
       });
     });
 
-    // Step 4 — Dummy mode ON
-    const bool useDummyBeacons = true;
+    // ---------------------------------------------------------
+    // 5️⃣ Dummy mode
+    // ---------------------------------------------------------
     if (useDummyBeacons) {
       debugPrint("🧪 Using dummy beacons...");
-      _loadDummyBeacons();
+      _loadDummyBeacons(); // also starts fluctuations
       return;
     }
 
-    // Step 5 — Real BLE scan (disabled for now)
+    // ---------------------------------------------------------
+    // 6️⃣ Real BLE scan (iBeacon + Eddystone only)
+    // ---------------------------------------------------------
     try {
       _scanSub = _ble
           .scanForDevices(withServices: [], scanMode: _scanMode)
@@ -607,44 +607,26 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
         final obs = parseAdvertisement(
           id: d.id,
           rssi: d.rssi,
-          manufacturerData: d.manufacturerData is Uint8List
-              ? d.manufacturerData as Uint8List
-              : (d.manufacturerData != null
-              ? Uint8List.fromList(
-              List<int>.from(d.manufacturerData as List<int>))
-              : null),
-          serviceData: d.serviceData is Map<Uuid, Uint8List>
-              ? Map<Uuid, Uint8List>.from(d.serviceData)
-              : (d.serviceData != null
-              ? Map<Uuid, Uint8List>.from(
-            (d.serviceData as Map).map(
-                  (k, v) => MapEntry(
-                k as Uuid,
-                Uint8List.fromList(List<int>.from(v)),
-              ),
-            ),
-          )
-              : null),
+          manufacturerData: d.manufacturerData,
+          serviceData: Map<Uuid, Uint8List>.from(d.serviceData),
         );
 
-        if (obs == null) {
-          // Unknown BLE device
-          final unk = Observation(
-            id: d.id,
-            type: "BLE",
-            info: "(raw)",
-            rssi: d.rssi,
-            seenAt: DateTime.now(),
-          );
-
-          _found[d.id] =
-              _found[d.id]?.copyUpdated(rssi: unk.rssi, seenAt: unk.seenAt) ??
-                  unk;
-
+        // Ignore normal BLE — only allow iBeacon & Eddystone
+        if (obs == null ||
+            (obs.type != 'iBeacon' && obs.type != 'Eddystone')) {
           return;
         }
 
-        // AoA extraction
+        // Assign mock XY position if new
+        if (!mockBeaconPositions.containsKey(obs.id)) {
+          if (_assignedDemoCount < _demoPositions.length) {
+            mockBeaconPositions[obs.id] = _demoPositions[_assignedDemoCount];
+            _assignedDemoCount++;
+            debugPrint("📍 Assigned dummy position to ${obs.id}");
+          }
+        }
+
+        // Extract AoA if present
         double? aoa;
         try {
           if (d.manufacturerData != null &&
@@ -655,23 +637,14 @@ class _BeaconScannerScreenState extends State<BeaconScannerScreen> {
           }
         } catch (_) {}
 
-        if (aoa == null && d.serviceData != null) {
-          for (var e in d.serviceData.entries) {
-            aoa = tryExtractAoAFromBytes(List<int>.from(e.value));
-            if (aoa != null) break;
-          }
-        }
-
-        // Update UI list
-        final existing = _found[d.id];
-        _found[d.id] = existing != null
+        // Update observation list
+        final existing = _found[obs.id];
+        _found[obs.id] = existing != null
             ? existing.copyUpdated(rssi: obs.rssi, seenAt: obs.seenAt)
             : obs;
 
-        // Process distance filtering
+        // Process smoothing, clamping, filtering
         _processObservation(obs, aoa: aoa);
-      }, onError: (e) {
-        debugPrint("❌ Scan error: $e");
       });
     } catch (e) {
       _snack("Error: $e");
